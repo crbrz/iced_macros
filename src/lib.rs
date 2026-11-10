@@ -3,26 +3,54 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{FnArg, Ident, ImplItem, ItemImpl, Pat, ReturnType, Type, parse_macro_input, parse_quote, spanned::Spanned};
 
+struct Options {
+    message: Ident,
+    now: bool,
+}
+
 /// Use on an `impl` block. Methods marked `#[handler]` become `Message` variants,
 /// and an `update` method dispatching to them is generated.
 ///
-/// - 0 arguments: unit variant
-/// - 1 argument:  tuple variant
-/// - 2+ arguments: struct variant with the original argument names
+/// - 0 fields: unit variant
+/// - 1 field:  tuple variant
+/// - 2+ fields: struct variant with the original argument names
 ///
-/// Optional: `#[component(MyMessage)]` to override the enum name (default: `Message`).
+/// Options:
+/// - `message = Name`: override the enum name (default: `Message`).
+/// - `now`: `update` takes an extra `now: Instant` argument. Handler arguments
+///   named `now` are not stored in the message; they receive `update`'s `now`.
+///
+/// `Instant` is resolved at the call site, so import whichever one you use
+/// (`std::time::Instant` or `iced::time::Instant`).
 #[proc_macro_attribute]
 pub fn component(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let msg_ident: Ident = if attr.is_empty() { format_ident!("Message") } else { parse_macro_input!(attr as Ident) };
+    let mut message = format_ident!("Message");
+    let mut now = false;
+
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("message") {
+            message = meta.value()?.parse()?;
+            Ok(())
+        } else if meta.path.is_ident("now") {
+            now = true;
+            Ok(())
+        } else {
+            Err(meta.error("unsupported option; expected `message = Name` or `now`"))
+        }
+    });
+    parse_macro_input!(attr with parser);
+
+    let opts = Options { message, now };
     let mut imp = parse_macro_input!(item as ItemImpl);
 
-    match expand(&msg_ident, &mut imp) {
+    match expand(&opts, &mut imp) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-fn expand(msg: &Ident, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+fn expand(opts: &Options, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenStream> {
+    let msg = &opts.message;
     let mut variants = Vec::new();
     let mut arms = Vec::new();
     let mut ret: Option<ReturnType> = None;
@@ -51,8 +79,11 @@ fn expand(msg: &Ident, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenStre
             _ => return Err(syn::Error::new(f.sig.span(), "handler must take `&mut self` as its first argument")),
         }
 
-        // Remaining arguments: collect (name, type).
-        let mut args: Vec<(Ident, Type)> = Vec::new();
+        // Remaining arguments, in order. `call_args` is everything passed to the
+        // handler; `fields` is what ends up in the message (i.e. without `now`).
+        let mut call_args: Vec<Ident> = Vec::new();
+        let mut fields: Vec<(Ident, Type)> = Vec::new();
+
         for arg in inputs {
             match arg {
                 FnArg::Typed(pt) => {
@@ -63,13 +94,27 @@ fn expand(msg: &Ident, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenStre
                              so they can be used as message field names",
                         ));
                     };
-                    args.push((pat_ident.ident.clone(), (*pt.ty).clone()));
+                    let ident = pat_ident.ident.clone();
+                    call_args.push(ident.clone());
+
+                    if ident == "now" {
+                        if !opts.now {
+                            return Err(syn::Error::new(
+                                ident.span(),
+                                "this handler takes `now`, but `#[component]` was not given \
+                                 the `now` option; use `#[component(now)]`",
+                            ));
+                        }
+                        // Supplied by `update`, not stored in the message.
+                    } else {
+                        fields.push((ident, (*pt.ty).clone()));
+                    }
                 }
                 FnArg::Receiver(r) => return Err(syn::Error::new(r.span(), "unexpected receiver")),
             }
         }
-        let names: Vec<&Ident> = args.iter().map(|(n, _)| n).collect();
-        let types: Vec<&Type> = args.iter().map(|(_, t)| t).collect();
+        let names: Vec<&Ident> = fields.iter().map(|(n, _)| n).collect();
+        let types: Vec<&Type> = fields.iter().map(|(_, t)| t).collect();
 
         // All handlers must share the same return type; it becomes `update`'s.
         let out = f.sig.output.clone();
@@ -82,21 +127,24 @@ fn expand(msg: &Ident, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenStre
             }
         }
 
-        match args.len() {
+        // Variant shape depends on the fields left after removing `now`.
+        match fields.len() {
             0 => {
                 variants.push(quote! { #variant });
-                arms.push(quote! { #msg::#variant => self.#fn_ident() });
+                arms.push(quote! {
+                    #msg::#variant => self.#fn_ident(#(#call_args),*)
+                });
             }
             1 => {
                 variants.push(quote! { #variant(#(#types),*) });
                 arms.push(quote! {
-                    #msg::#variant(#(#names),*) => self.#fn_ident(#(#names),*)
+                    #msg::#variant(#(#names),*) => self.#fn_ident(#(#call_args),*)
                 });
             }
             _ => {
                 variants.push(quote! { #variant { #(#names: #types),* } });
                 arms.push(quote! {
-                    #msg::#variant { #(#names),* } => self.#fn_ident(#(#names),*)
+                    #msg::#variant { #(#names),* } => self.#fn_ident(#(#call_args),*)
                 });
             }
         }
@@ -104,8 +152,16 @@ fn expand(msg: &Ident, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenStre
 
     let ret = ret.unwrap_or(ReturnType::Default);
 
+    let (now_param, now_use) = if opts.now {
+        // `let _ = now;` avoids an unused-variable warning when no handler uses it.
+        (quote! { , now: Instant }, quote! { let _ = now; })
+    } else {
+        (quote! {}, quote! {})
+    };
+
     let update: ImplItem = parse_quote! {
-        pub fn update(&mut self, message: #msg) #ret {
+        pub fn update(&mut self, message: #msg #now_param) #ret {
+            #now_use
             match message {
                 #(#arms),*
             }
