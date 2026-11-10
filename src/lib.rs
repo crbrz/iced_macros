@@ -152,16 +152,11 @@ fn expand(opts: &Options, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenS
 
     let ret = ret.unwrap_or(ReturnType::Default);
 
-    let (now_param, now_use) = if opts.now {
-        // `let _ = now;` avoids an unused-variable warning when no handler uses it.
-        (quote! { , now: Instant }, quote! { let _ = now; })
-    } else {
-        (quote! {}, quote! {})
-    };
+    let (now_param, now_store) = if opts.now { (quote! { , now: Instant }, quote! { self.now = now; }) } else { (quote! {}, quote! {}) };
 
     let update: ImplItem = parse_quote! {
         pub fn update(&mut self, message: #msg #now_param) #ret {
-            #now_use
+            #now_store
             match message {
                 #(#arms),*
             }
