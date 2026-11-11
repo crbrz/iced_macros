@@ -5,7 +5,8 @@ use syn::{FnArg, Ident, ImplItem, ItemImpl, Pat, ReturnType, Type, parse_macro_i
 
 struct Options {
     message: Ident,
-    now: bool,
+    message_derive_debug: bool,
+    use_animation: bool,
 }
 
 /// Use on an `impl` block. Methods marked `#[handler]` become `Message` variants,
@@ -17,30 +18,33 @@ struct Options {
 ///
 /// Options:
 /// - `message = Name`: override the enum name (default: `Message`).
-/// - `now`: `update` takes an extra `now: Instant` argument. Handler arguments
-///   named `now` are not stored in the message; they receive `update`'s `now`.
-///
-/// `Instant` is resolved at the call site, so import whichever one you use
-/// (`std::time::Instant` or `iced::time::Instant`).
+/// - `message_no_debug`: don't add Debug in message derive list.
+/// - `use_animation`: `update` takes an extra `now: Instant` argument. Handler arguments
+///   named `now` are not stored in the message; they receive `update`'s `now`. Also, `now` is stored
+///   in struct (must be declared manually)
 #[proc_macro_attribute]
 pub fn component(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut message = format_ident!("Message");
-    let mut now = false;
+    let mut message_derive_debug = true;
+    let mut use_animation = false;
 
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("message") {
             message = meta.value()?.parse()?;
             Ok(())
-        } else if meta.path.is_ident("now") {
-            now = true;
+        } else if meta.path.is_ident("use_animation") {
+            use_animation = true;
+            Ok(())
+        } else if meta.path.is_ident("message_no_debug") {
+            message_derive_debug = false;
             Ok(())
         } else {
-            Err(meta.error("unsupported option; expected `message = Name` or `now`"))
+            Err(meta.error("unsupported option; expected `message = Name`, `message_derive_debug` `use_animation = true`"))
         }
     });
     parse_macro_input!(attr with parser);
 
-    let opts = Options { message, now };
+    let opts = Options { message, message_derive_debug, use_animation };
     let mut imp = parse_macro_input!(item as ItemImpl);
 
     match expand(&opts, &mut imp) {
@@ -98,7 +102,7 @@ fn expand(opts: &Options, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenS
                     call_args.push(ident.clone());
 
                     if ident == "now" {
-                        if !opts.now {
+                        if !opts.use_animation {
                             return Err(syn::Error::new(
                                 ident.span(),
                                 "this handler takes `now`, but `#[component]` was not given \
@@ -152,7 +156,7 @@ fn expand(opts: &Options, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenS
 
     let ret = ret.unwrap_or(ReturnType::Default);
 
-    let (now_param, now_store) = if opts.now { (quote! { , now: Instant }, quote! { self.now = now; }) } else { (quote! {}, quote! {}) };
+    let (now_param, now_store) = if opts.use_animation { (quote! { , now: Instant }, quote! { self.now = now; }) } else { (quote! {}, quote! {}) };
 
     let update: ImplItem = parse_quote! {
         pub fn update(&mut self, message: #msg #now_param) #ret {
@@ -164,8 +168,14 @@ fn expand(opts: &Options, imp: &mut ItemImpl) -> syn::Result<proc_macro2::TokenS
     };
     imp.items.push(update);
 
+    let derive = if opts.message_derive_debug {
+        quote! { Debug, Clone }
+    } else {
+        quote! { Clone }
+    };
+
     Ok(quote! {
-        #[derive(Debug, Clone)]
+        #[derive(#derive)]
         pub enum #msg {
             #(#variants),*
         }
